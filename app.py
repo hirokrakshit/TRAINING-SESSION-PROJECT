@@ -1,17 +1,14 @@
 import streamlit as st
 import cv2
-import mediapipe as mp
 import numpy as np
 from PIL import Image
+import requests
+import json
 
 # Page configuration
 st.set_page_config(page_title="AI Fitness Coach", layout="wide")
 st.title("🏋️ AI Fitness Coach – Pose Detection")
-st.markdown("Real-time posture detection and rep counting using MediaPipe + OpenCV")
-
-# Initialize MediaPipe
-mp_drawing = mp.solutions.drawing_utils
-mp_pose = mp.solutions.pose
+st.markdown("Real-time posture detection and rep counting using Pose Estimation")
 
 # Initialize session state
 if 'counter' not in st.session_state:
@@ -30,31 +27,104 @@ def calculate_angle(a, b, c):
         angle = 360 - angle
     return angle
 
+def detect_poses_movenet(image):
+    """Detect poses using MoveNet model via TensorFlow Hub"""
+    try:
+        import tensorflow as tf
+        import tensorflow_hub as hub
+        
+        # Load MoveNet model
+        @st.cache_resource
+        def load_model():
+            model = hub.load('https://tfhub.dev/google/movenet/singlepose/lightning/4')
+            return model
+        
+        model = load_model()
+        movenet = model.signatures['serving_default']
+        
+        # Preprocess image
+        img = tf.image.resize_with_pad(tf.expand_dims(image, axis=0), 192, 192)
+        img = tf.cast(img, dtype=tf.int32)
+        
+        # Run inference
+        outputs = movenet(img)
+        keypoints = outputs['output_0'].numpy()[0][0]
+        
+        return keypoints
+    except Exception as e:
+        st.error(f"Error loading TensorFlow model: {e}")
+        return None
+
+def detect_poses_opencv(image):
+    """Detect poses using OpenCV DNN with OpenPose model"""
+    try:
+        # This is a simplified version - you would need the OpenPose model files
+        # For deployment, we'll use a simpler approach
+        st.warning("OpenCV DNN pose detection requires model files. Using alternative method.")
+        return None
+    except Exception as e:
+        st.error(f"Error with OpenCV detection: {e}")
+        return None
+
+def draw_keypoints(image, keypoints, confidence_threshold=0.3):
+    """Draw detected keypoints on image"""
+    h, w = image.shape[:2]
+    
+    # MoveNet keypoint indices
+    # 0: nose, 1: left_eye, 2: right_eye, 3: left_ear, 4: right_ear
+    # 5: left_shoulder, 6: right_shoulder, 7: left_elbow, 8: right_elbow
+    # 9: left_wrist, 10: right_wrist, 11: left_hip, 12: right_hip
+    # 13: left_knee, 14: right_knee, 15: left_ankle, 16: right_ankle
+    
+    connections = [
+        (5, 7), (7, 9),   # Left arm
+        (6, 8), (8, 10),  # Right arm
+        (5, 6),           # Shoulders
+        (5, 11), (6, 12), # Torso
+        (11, 12),         # Hips
+        (11, 13), (13, 15), # Left leg
+        (12, 14), (14, 16)  # Right leg
+    ]
+    
+    # Draw connections
+    for connection in connections:
+        start_idx, end_idx = connection
+        if keypoints[start_idx][2] > confidence_threshold and keypoints[end_idx][2] > confidence_threshold:
+            start_point = (int(keypoints[start_idx][1] * w), int(keypoints[start_idx][0] * h))
+            end_point = (int(keypoints[end_idx][1] * w), int(keypoints[end_idx][0] * h))
+            cv2.line(image, start_point, end_point, (245, 66, 230), 2)
+    
+    # Draw keypoints
+    for i, kp in enumerate(keypoints):
+        if kp[2] > confidence_threshold:
+            x, y = int(kp[1] * w), int(kp[0] * h)
+            cv2.circle(image, (x, y), 4, (245, 117, 66), -1)
+    
+    return image
+
 def process_frame(image, exercise):
     """Process a single frame for pose detection"""
-    # Convert to RGB
-    image_rgb = cv2.cvtColor(np.array(image), cv2.COLOR_BGR2RGB)
+    # Convert to RGB array
+    image_array = np.array(image)
+    if len(image_array.shape) == 2:  # Grayscale
+        image_array = cv2.cvtColor(image_array, cv2.COLOR_GRAY2RGB)
+    elif image_array.shape[2] == 4:  # RGBA
+        image_array = cv2.cvtColor(image_array, cv2.COLOR_RGBA2RGB)
     
-    # Process with MediaPipe
-    with mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5) as pose:
-        results = pose.process(image_rgb)
+    # Detect poses
+    keypoints = detect_poses_movenet(image_array)
+    
+    if keypoints is not None:
+        h, w = image_array.shape[:2]
         
-        # Convert back to BGR for OpenCV drawing
-        image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-        
-        if results.pose_landmarks:
-            landmarks = results.pose_landmarks.landmark
-            
-            try:
-                if exercise == "Push-ups":
-                    # Get coordinates
-                    left_shoulder = [landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x,
-                                   landmarks[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y]
-                    left_elbow = [landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].x,
-                                landmarks[mp_pose.PoseLandmark.LEFT_ELBOW.value].y]
-                    left_wrist = [landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].x,
-                                landmarks[mp_pose.PoseLandmark.LEFT_WRIST.value].y]
-                    
+        try:
+            if exercise == "Push-ups":
+                # Keypoint indices: 5=left_shoulder, 7=left_elbow, 9=left_wrist
+                left_shoulder = [keypoints[5][1] * w, keypoints[5][0] * h]
+                left_elbow = [keypoints[7][1] * w, keypoints[7][0] * h]
+                left_wrist = [keypoints[9][1] * w, keypoints[9][0] * h]
+                
+                if keypoints[5][2] > 0.3 and keypoints[7][2] > 0.3 and keypoints[9][2] > 0.3:
                     angle = calculate_angle(left_shoulder, left_elbow, left_wrist)
                     
                     # Rep counting logic
@@ -64,15 +134,13 @@ def process_frame(image, exercise):
                         st.session_state.stage = "down"
                         st.session_state.counter += 1
                         
-                elif exercise == "Squats":
-                    # Get coordinates
-                    left_hip = [landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].x,
-                              landmarks[mp_pose.PoseLandmark.LEFT_HIP.value].y]
-                    left_knee = [landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].x,
-                               landmarks[mp_pose.PoseLandmark.LEFT_KNEE.value].y]
-                    left_ankle = [landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].x,
-                                landmarks[mp_pose.PoseLandmark.LEFT_ANKLE.value].y]
-                    
+            elif exercise == "Squats":
+                # Keypoint indices: 11=left_hip, 13=left_knee, 15=left_ankle
+                left_hip = [keypoints[11][1] * w, keypoints[11][0] * h]
+                left_knee = [keypoints[13][1] * w, keypoints[13][0] * h]
+                left_ankle = [keypoints[15][1] * w, keypoints[15][0] * h]
+                
+                if keypoints[11][2] > 0.3 and keypoints[13][2] > 0.3 and keypoints[15][2] > 0.3:
                     angle = calculate_angle(left_hip, left_knee, left_ankle)
                     
                     # Rep counting logic
@@ -81,37 +149,31 @@ def process_frame(image, exercise):
                     if angle < 90 and st.session_state.stage == "up":
                         st.session_state.stage = "down"
                         st.session_state.counter += 1
-                
-                # Draw stats box
-                cv2.rectangle(image_bgr, (0,0), (225,73), (245,117,16), -1)
-                
-                # Display REPS
-                cv2.putText(image_bgr, 'REPS', (15,20),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv2.LINE_AA)
-                cv2.putText(image_bgr, str(st.session_state.counter),
-                          (10,60),
-                          cv2.FONT_HERSHEY_SIMPLEX, 2, (255,255,255), 2, cv2.LINE_AA)
-                
-                # Display STAGE
-                cv2.putText(image_bgr, 'STAGE', (65,20),
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1, cv2.LINE_AA)
-                cv2.putText(image_bgr, st.session_state.stage if st.session_state.stage else "-",
-                          (60,60),
-                          cv2.FONT_HERSHEY_SIMPLEX, 2, (255,255,255), 2, cv2.LINE_AA)
-                
-            except Exception as e:
-                st.error(f"Error processing landmarks: {e}")
             
-            # Draw pose landmarks
-            mp_drawing.draw_landmarks(
-                image_bgr, 
-                results.pose_landmarks, 
-                mp_pose.POSE_CONNECTIONS,
-                mp_drawing.DrawingSpec(color=(245,117,66), thickness=2, circle_radius=2),
-                mp_drawing.DrawingSpec(color=(245,66,230), thickness=2, circle_radius=2)
-            )
+        except Exception as e:
+            st.warning(f"Could not calculate angles: {e}")
         
-        return image_bgr
+        # Draw keypoints
+        image_array = draw_keypoints(image_array, keypoints)
+    
+    # Draw stats box
+    cv2.rectangle(image_array, (0, 0), (225, 73), (245, 117, 16), -1)
+    
+    # Display REPS
+    cv2.putText(image_array, 'REPS', (15, 20),
+              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    cv2.putText(image_array, str(st.session_state.counter),
+              (10, 60),
+              cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 2, cv2.LINE_AA)
+    
+    # Display STAGE
+    cv2.putText(image_array, 'STAGE', (65, 20),
+              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
+    cv2.putText(image_array, st.session_state.stage if st.session_state.stage else "-",
+              (60, 60),
+              cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 2, cv2.LINE_AA)
+    
+    return image_array
 
 # Sidebar controls
 st.sidebar.header("Controls")
@@ -169,7 +231,7 @@ if camera_method == "Upload Image":
         processed_image = process_frame(image, exercise)
         
         # Display
-        st.image(processed_image, channels="BGR", use_container_width=True)
+        st.image(processed_image, channels="RGB", use_container_width=True)
 
 else:  # Webcam Snapshot
     st.info("📸 Click the button below to take a snapshot from your webcam")
@@ -184,13 +246,13 @@ else:  # Webcam Snapshot
         processed_image = process_frame(image, exercise)
         
         # Display
-        st.image(processed_image, channels="BGR", use_container_width=True)
+        st.image(processed_image, channels="RGB", use_container_width=True)
 
 # Footer
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center'>
-    <p>Built with Streamlit, MediaPipe, and OpenCV</p>
+    <p>Built with Streamlit, TensorFlow, and OpenCV</p>
     <p>💡 Tip: Make sure your full body is visible in the frame for best results</p>
 </div>
 """, unsafe_allow_html=True)
