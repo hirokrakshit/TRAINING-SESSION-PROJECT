@@ -1,8 +1,7 @@
 import streamlit as st
-import cv2
 import numpy as np
-from PIL import Image
-import math
+from PIL import Image, ImageDraw, ImageFont
+import io
 
 # Page configuration
 st.set_page_config(page_title="AI Fitness Coach", layout="wide")
@@ -14,8 +13,6 @@ if 'counter' not in st.session_state:
     st.session_state.counter = 0
 if 'stage' not in st.session_state:
     st.session_state.stage = None
-if 'processed_images' not in st.session_state:
-    st.session_state.processed_images = []
 
 def calculate_angle(a, b, c):
     """Calculate angle between three points"""
@@ -28,65 +25,84 @@ def calculate_angle(a, b, c):
         angle = 360 - angle
     return angle
 
-@st.cache_resource
-def load_pose_model():
-    """Load OpenPose model using OpenCV DNN"""
-    try:
-        # Using COCO model for pose detection
-        protoFile = "https://raw.githubusercontent.com/CMU-Perceptual-Computing-Lab/openpose/master/models/pose/coco/pose_deploy_linevec.prototxt"
-        weightsFile = "http://posefs1.perception.cs.cmu.edu/OpenPose/models/pose/coco/pose_iter_440000.caffemodel"
-        
-        # For cloud deployment, we'll use a simpler approach
-        st.info("Using simplified pose detection algorithm optimized for deployment")
-        return None
-    except Exception as e:
-        st.warning(f"Model loading skipped: {e}")
-        return None
+def detect_edges_simple(image_array):
+    """Simple edge detection without OpenCV"""
+    # Convert to grayscale
+    if len(image_array.shape) == 3:
+        gray = np.dot(image_array[...,:3], [0.2989, 0.5870, 0.1140])
+    else:
+        gray = image_array
+    
+    # Simple Sobel-like edge detection
+    kernel_x = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]])
+    kernel_y = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]])
+    
+    # Pad image
+    padded = np.pad(gray, 1, mode='edge')
+    
+    # Apply kernels
+    h, w = gray.shape
+    edges = np.zeros_like(gray)
+    
+    for i in range(h):
+        for j in range(w):
+            patch = padded[i:i+3, j:j+3]
+            gx = np.sum(patch * kernel_x)
+            gy = np.sum(patch * kernel_y)
+            edges[i, j] = np.sqrt(gx**2 + gy**2)
+    
+    # Threshold
+    edges = (edges > np.percentile(edges, 90)).astype(np.uint8) * 255
+    
+    return edges
 
 def detect_body_parts_simple(image_array):
-    """Simplified body part detection using color and contour analysis"""
-    # Convert to grayscale
-    gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+    """Simplified body part detection"""
+    h, w = image_array.shape[:2]
     
-    # Apply blur and edge detection
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150)
+    # Detect edges
+    edges = detect_edges_simple(image_array)
     
-    # Find contours
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Find the main body region (center of mass of edges)
+    edge_points = np.argwhere(edges > 0)
     
-    if contours:
-        # Get the largest contour (assumed to be the person)
-        largest_contour = max(contours, key=cv2.contourArea)
+    if len(edge_points) > 100:
+        # Calculate bounding box
+        y_min, x_min = edge_points.min(axis=0)
+        y_max, x_max = edge_points.max(axis=0)
         
-        # Get bounding box
-        x, y, w, h = cv2.boundingRect(largest_contour)
+        center_x = (x_min + x_max) // 2
+        center_y = (y_min + y_max) // 2
+        width = x_max - x_min
+        height = y_max - y_min
         
-        # Estimate body parts based on proportions
-        # These are rough estimates for demonstration
+        # Estimate keypoints based on human body proportions
         keypoints = {
-            'left_shoulder': (x + w * 0.35, y + h * 0.25),
-            'right_shoulder': (x + w * 0.65, y + h * 0.25),
-            'left_elbow': (x + w * 0.25, y + h * 0.45),
-            'right_elbow': (x + w * 0.75, y + h * 0.45),
-            'left_wrist': (x + w * 0.20, y + h * 0.60),
-            'right_wrist': (x + w * 0.80, y + h * 0.60),
-            'left_hip': (x + w * 0.40, y + h * 0.60),
-            'right_hip': (x + w * 0.60, y + h * 0.60),
-            'left_knee': (x + w * 0.40, y + h * 0.80),
-            'right_knee': (x + w * 0.60, y + h * 0.80),
-            'left_ankle': (x + w * 0.40, y + h * 0.95),
-            'right_ankle': (x + w * 0.60, y + h * 0.95),
+            'left_shoulder': (center_x - width * 0.15, y_min + height * 0.25),
+            'right_shoulder': (center_x + width * 0.15, y_min + height * 0.25),
+            'left_elbow': (center_x - width * 0.25, y_min + height * 0.45),
+            'right_elbow': (center_x + width * 0.25, y_min + height * 0.45),
+            'left_wrist': (center_x - width * 0.30, y_min + height * 0.60),
+            'right_wrist': (center_x + width * 0.30, y_min + height * 0.60),
+            'left_hip': (center_x - width * 0.10, y_min + height * 0.60),
+            'right_hip': (center_x + width * 0.10, y_min + height * 0.60),
+            'left_knee': (center_x - width * 0.10, y_min + height * 0.80),
+            'right_knee': (center_x + width * 0.10, y_min + height * 0.80),
+            'left_ankle': (center_x - width * 0.10, y_min + height * 0.95),
+            'right_ankle': (center_x + width * 0.10, y_min + height * 0.95),
         }
         
-        return keypoints, (x, y, w, h)
+        return keypoints
     
-    return None, None
+    return None
 
-def draw_skeleton(image, keypoints):
-    """Draw skeleton on the image"""
+def draw_skeleton_pil(image, keypoints):
+    """Draw skeleton using PIL instead of OpenCV"""
+    img_pil = Image.fromarray(image)
+    draw = ImageDraw.Draw(img_pil)
+    
     if keypoints is None:
-        return image
+        return np.array(img_pil)
     
     # Define connections
     connections = [
@@ -109,25 +125,45 @@ def draw_skeleton(image, keypoints):
         if start in keypoints and end in keypoints:
             start_point = tuple(map(int, keypoints[start]))
             end_point = tuple(map(int, keypoints[end]))
-            cv2.line(image, start_point, end_point, (0, 255, 0), 2)
+            draw.line([start_point, end_point], fill=(0, 255, 0), width=3)
     
     # Draw keypoints
     for point in keypoints.values():
-        cv2.circle(image, tuple(map(int, point)), 5, (0, 0, 255), -1)
+        x, y = map(int, point)
+        draw.ellipse([x-5, y-5, x+5, y+5], fill=(255, 0, 0))
     
-    return image
+    return np.array(img_pil)
+
+def add_stats_overlay(image_array, counter, stage):
+    """Add stats overlay using PIL"""
+    img_pil = Image.fromarray(image_array)
+    draw = ImageDraw.Draw(img_pil)
+    
+    # Draw background rectangle
+    draw.rectangle([0, 0, 225, 73], fill=(245, 117, 16))
+    
+    # Draw text (using default font)
+    draw.text((15, 10), 'REPS', fill=(0, 0, 0))
+    draw.text((10, 35), str(counter), fill=(255, 255, 255))
+    
+    draw.text((120, 10), 'STAGE', fill=(0, 0, 0))
+    draw.text((115, 35), stage if stage else "-", fill=(255, 255, 255))
+    
+    return np.array(img_pil)
 
 def process_frame(image, exercise):
     """Process a single frame for pose detection"""
     # Convert to numpy array
     image_array = np.array(image)
-    if len(image_array.shape) == 2:  # Grayscale
-        image_array = cv2.cvtColor(image_array, cv2.COLOR_GRAY2RGB)
-    elif image_array.shape[2] == 4:  # RGBA
-        image_array = cv2.cvtColor(image_array, cv2.COLOR_RGBA2RGB)
+    
+    # Ensure RGB
+    if len(image_array.shape) == 2:
+        image_array = np.stack([image_array]*3, axis=-1)
+    elif image_array.shape[2] == 4:
+        image_array = image_array[:, :, :3]
     
     # Detect body parts
-    keypoints, bbox = detect_body_parts_simple(image_array)
+    keypoints = detect_body_parts_simple(image_array)
     
     if keypoints is not None:
         try:
@@ -160,32 +196,20 @@ def process_frame(image, exercise):
                     st.session_state.counter += 1
             
             # Draw skeleton
-            image_array = draw_skeleton(image_array, keypoints)
+            image_array = draw_skeleton_pil(image_array, keypoints)
             
         except Exception as e:
-            st.warning(f"Pose analysis in progress... {e}")
+            st.warning(f"Analyzing pose... {str(e)}")
     else:
-        # Draw message if no person detected
+        # Add message using PIL
+        img_pil = Image.fromarray(image_array)
+        draw = ImageDraw.Draw(img_pil)
         h, w = image_array.shape[:2]
-        cv2.putText(image_array, 'Position yourself in frame', (w//4, h//2),
-                   cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2, cv2.LINE_AA)
+        draw.text((w//4, h//2), 'Position yourself in frame', fill=(255, 0, 0))
+        image_array = np.array(img_pil)
     
-    # Draw stats box
-    cv2.rectangle(image_array, (0, 0), (225, 73), (245, 117, 16), -1)
-    
-    # Display REPS
-    cv2.putText(image_array, 'REPS', (15, 20),
-              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-    cv2.putText(image_array, str(st.session_state.counter),
-              (10, 60),
-              cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 2, cv2.LINE_AA)
-    
-    # Display STAGE
-    cv2.putText(image_array, 'STAGE', (120, 20),
-              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA)
-    cv2.putText(image_array, st.session_state.stage if st.session_state.stage else "-",
-              (115, 60),
-              cv2.FONT_HERSHEY_SIMPLEX, 2, (255, 255, 255), 2, cv2.LINE_AA)
+    # Add stats overlay
+    image_array = add_stats_overlay(image_array, st.session_state.counter, st.session_state.stage)
     
     return image_array
 
@@ -258,17 +282,16 @@ with tab1:
             
             with col2:
                 st.subheader("Analyzed Image")
-                # Process frame
-                processed_image = process_frame(image, exercise)
-                st.image(processed_image, channels="RGB", use_container_width=True)
+                with st.spinner("Analyzing pose..."):
+                    processed_image = process_frame(image, exercise)
+                    st.image(processed_image, use_container_width=True)
     
-    else:  # Webcam Snapshot
+    else:
         st.info("📸 Take a snapshot while performing the exercise (position yourself sideways)")
         
         camera_photo = st.camera_input("Capture image")
         
         if camera_photo is not None:
-            # Read image
             image = Image.open(camera_photo)
             
             col1, col2 = st.columns(2)
@@ -279,9 +302,9 @@ with tab1:
             
             with col2:
                 st.subheader("Analyzed Image")
-                # Process frame
-                processed_image = process_frame(image, exercise)
-                st.image(processed_image, channels="RGB", use_container_width=True)
+                with st.spinner("Analyzing pose..."):
+                    processed_image = process_frame(image, exercise)
+                    st.image(processed_image, use_container_width=True)
 
 with tab2:
     st.markdown("""
@@ -309,7 +332,8 @@ with tab2:
     
     **Technology Stack:**
     - Streamlit for the web interface
-    - OpenCV for image processing
+    - NumPy for image processing
+    - PIL for drawing and overlays
     - Custom pose detection algorithm
     """)
 
@@ -317,7 +341,7 @@ with tab2:
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #666;'>
-    <p>Built with ❤️ using Streamlit & OpenCV</p>
+    <p>Built with ❤️ using Streamlit, NumPy & PIL</p>
     <p style='font-size: 0.9em;'>For best results, ensure proper lighting and position yourself sideways to the camera</p>
 </div>
 """, unsafe_allow_html=True)
